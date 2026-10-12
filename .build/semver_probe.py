@@ -1,9 +1,9 @@
-# 把 MusicBoxEntry.cs 里那套 semver 比较原样抽出来，在裁剪无关的普通 .NET 里跑一遍真值表。
+# 把 MusicBoxUpdate.cs 里那套 semver 比较原样抽出来，在裁剪无关的普通 .NET 里跑一遍真值表。
 # 只读源文件、不改源文件；生成物都在 .build/TEMP 下，不进仓库。
 import pathlib, subprocess, os, sys
 
 proj = pathlib.Path(__file__).resolve().parents[1]
-src = (proj / "Scripts" / "MusicBoxEntry.cs").read_text(encoding="utf-8")
+src = (proj / "Scripts" / "MusicBoxUpdate.cs").read_text(encoding="utf-8")
 start = src.index("// 版本比较照严格 semver")
 end = src.index("// 桥接游戏的统一更新提醒")
 body = "\n".join(line[8:] if line.startswith(" " * 8) else line for line in src[start:end].rstrip().splitlines())

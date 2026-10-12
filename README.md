@@ -6,7 +6,7 @@
 - 适用游戏版本：《植物大战僵尸杂交版》`0.30.0.0`
 - 引擎版本：Godot `4.7.0`（.NET 版）
 - .NET 目标框架 `net9.0`，所需 SDK `9.0` 及以上
-- 模组版本：`1.2.3`（严格 semver，不带构建号）
+- 模组版本：`1.2.4`
 - 模组作者：百合小希
 
 **关于开发方式**：本模组是在 Qwen3.8 Flash 的协助下开发的，本模组所有内容均由 AI 参与制作与审阅。
@@ -35,7 +35,8 @@
 
 ```
 mod.json                  模组清单：settings 面板声明、playInstructions、资源与运行时入口
-Scripts/MusicBoxEntry.cs  唯一的运行时代码（约 1600 行，注释写在关键取舍上）
+Scripts/MusicBoxEntry.cs  运行时代码主体：面板、音频扫描、场景与对话钩子、包内声明回写
+Scripts/MusicBoxUpdate.cs 同一个类的另一半（partial）：更新源、启动时那一次请求与重试、严格 semver 比较、上报统一提醒
 changelog.txt             更新记录的唯一来源，模组会把它回写进「关于」页
 LICENSE                   MIT 许可全文
 build.py                  构建一条龙：编译 → 校验 → 打包 → 核对（见「构建与打包」）
@@ -75,9 +76,9 @@ python build.py --probe "<BGM 目录>"   # 额外跑一遍音频预检，可重�
 **版本号一律严格 semver**（SemVer 2.0）：正式版写三段（`1.2.3`、`1.3.0`），内测照预发布标记分三档——
 `1.3.0-alpha.1`（还在试方向）、`1.3.0-beta.2`（功能齐了、等验证）、`1.3.0-rc.1`（没新问题就当正式版发）。
 它由定版的人手写进 `mod.json` 的 `version`，打包一个字节都不改它；写成四段（`1.2.2.6`）或带上构建号都会被打包直接拦下。
-定新版要一起改的只有三处：`version`、「关于」页那句 `音乐盒 v1.2.3`、以及 `changelog.txt` 里新加的那一段
+定新版要一起改的只有三处：`version`、「关于」页那句 `音乐盒 v<版本号>`、以及 `changelog.txt` 里新加的那一段
 （改完跑一次 `python .build/seed.py`，把公告正文同步进 `mod.json`）。
-**构建号已经取消**：同一个版反复出包就是覆盖同一个包名（正式包就叫 `MusicBox-1.2.3.pmod`，不带 ID 哈希那串后缀——
+**构建号已经取消**：同一个版反复出包就是覆盖同一个包名（正式包就叫 `MusicBox-<版本号>.pmod`，不带 ID 哈希那串后缀——
 防撞靠 `mod.json` 里的 `id`，文件名那八个字符对玩家没有意义），
 换版本后旧包名会留在 `dist\` 和存档 `Mods\` 里，所以打包会把同前缀的旧包删掉——
 游戏见到两个相同 ID 的包会判「存在重复的已安装 Mod ID」，整批不加载。
@@ -107,7 +108,7 @@ python .build/package.py "$PWD" --no-install
 # 5. 核对包内容
 python .build/verify.py
 
-# 6. 版本号比较的真值表（直接从 MusicBoxEntry.cs 抽出那段 semver 实现来跑，不引用游戏）
+# 6. 版本号比较的真值表（直接从 MusicBoxUpdate.cs 抽出那段 semver 实现来跑，不引用游戏）
 python .build/semver_probe.py
 ```
 
@@ -148,7 +149,7 @@ $env:PVZHOSTDIR = "<含那两份宿主程序集的目录>"
 - 游戏只在**进主菜单后的 2 秒内**收集各 Mod 上报的更新，用这份收集结果决定要不要自动弹提醒；晚于 2 秒上报的不会自动弹，但仍会留在「更新列表」里可以手动打开。网慢就是这个表现，跟"没建正式版 Release"的静默不同，日志能分清是哪种。
 - 还没有正式版 Release（全都还是草稿或预发布）时这个地址返回 404，等同「已最新」；仓库是 private 时同样 404，转 public 后自动恢复。
 
-地址写在 `Scripts/MusicBoxEntry.cs` 的 `UpdateFeedUrl` 里，仓库搬家 / 改名时要一起改；
+地址写在 `Scripts/MusicBoxUpdate.cs` 的 `UpdateFeedUrl` 里，仓库搬家 / 改名时要一起改；
 GitHub API 不给 `User-Agent` 会直接 403，所以同处的 `UpdateFeedHeaders` 也得留着。
 `python .build/verify.py` 会核对这几件事：`version` 是严格 semver 且不带 `+构建元数据`、「关于」页那句正好是 `v<版本>`、
 包名正好是 `MusicBox-<版本>.pmod` 且没混进 ID 哈希后缀、更新源地址里没有占位（例如还没填的 `OWNER`）、

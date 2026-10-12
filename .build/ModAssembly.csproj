@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <Compile Include="..\Scripts\MusicBoxEntry.cs" />
+    <Compile Include="..\Scripts\MusicBoxUpdate.cs" />
   </ItemGroup>
 
 </Project>
