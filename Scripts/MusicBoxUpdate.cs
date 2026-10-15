@@ -1,6 +1,7 @@
-// 音乐盒的启动更新检测：每次启动拉一次本仓库最新的 GitHub Release，按严格 semver 和本机版本号比大小，
-// 有新版就上报游戏的统一更新提醒。和 MusicBoxEntry.cs 是同一个类的另一半（partial）——面板、音频、
-// 场景钩子那些逻辑在那边，这里只有更新源、请求重试和版本比较。
+// 音乐盒的启动更新检测：面板「关于」里那个渠道下拉决定走哪条路（关闭 / 官网 / Github）。
+// 只有 Github 那条是本模组自己联网，结果上报游戏的统一更新提醒；官网那条请求由游戏自己发、提醒由游戏自己出，
+// 而「关闭」会把包里的 postId 一起清掉，让游戏也别去问官网。和 MusicBoxEntry.cs 是同一个类的另一半（partial）——
+// 面板、音频、场景钩子那些逻辑在那边，这里只有渠道分派、请求重试和版本比较。
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -14,18 +15,25 @@ namespace MusicBoxMod
     public sealed partial class MusicBoxEntry
     {
 
-        // 启动更新检测：面板总开关键 + 更新源地址。
-        // 更新源就是本仓库的 GitHub Release：最新 Release 的 tag 名当最新模组版本、Release 页当下载页，
-        // 所以发新版只要建一个 Release。tag 一律写**严格 semver**（SemVer 2.0）：
-        //   正式版三段数字（1.2.2、1.3.0）；内测按预发布标记分三档（1.3.0-alpha.1 / -beta.1 / -rc.1）；
-        //   tag 只写版本本身：构建号已经取消，而 semver 的「+构建元数据」按规范本来就不参与比较。
-        // GitHub 上勾了 pre-release 的 Release 不会被 /releases/latest 返回（官方文档：最新的
-        // 非草稿、非预发布那条），所以内测包天然不会推给玩家，玩家只会收到正式版的提醒。
-        // 仓库里不再有 update.txt。
+        // 渠道下拉的三个值。面板项 key 是 updateChannel，改动要下次启动才生效（applyMode=restart）。
+        //   off       模组不联网；同时把包里的官网投稿 ID 清掉，让游戏的官网检查也扫不到本模组。
+        //             （清空要重启一次才落到包上：游戏这次读的是已在内存里的清单。）
+        //   official  模组一条 GitHub 请求都不发，更新结果全部由游戏的官网检查给出。这一档模组不替游戏发请求，
+        //             也不自己上报——本模组成功上报过一次（有没有更新都算），游戏就会忽略这个 Mod 的官网结果。
+        //   github    模组自己查本仓库最新的 GitHub Release：tag 名当最新版、html_url 当下载页。
+        //             这是唯一由模组发起的网络请求，而且只连本仓库。
+        // tag 一律要求**严格 semver**（SemVer 2.0）：正式版三段数字（1.2.2、1.3.0），
+        // 内测按预发布标记分三档（1.3.0-alpha.1 / -beta.1 / -rc.1），构建号已经取消。
         // 请求走宿主自己的 NativeHttpRequest 节点：游戏导出裁剪了 BCL，泛型 HttpClient 的
         // 无参构造在运行时是「Method not found」，只有宿主自己用过的 API 才活得下来。
         // GitHub API 不给 User-Agent 会直接 403，这个头是必带的。
-        private const string UpdateCheckSetting = "enableUpdateCheck";
+        private const string UpdateChannelSetting = "updateChannel";
+        private const string ChannelOff = "off";
+        private const string ChannelOfficial = "official";
+        private const string ChannelGitHub = "github";
+        // 本模组在官网的投稿 ID，必须和 mod.json 里那个 postId 一致（闸门会核对）。
+        // 「关闭」渠道要把它从安装包里清掉、另两档要还原，还原时没地方可查，所以只能在这里也留一份。
+        private const string OfficialPostId = "2";
         private const string UpdateFeedUrl = "https://api.github.com/repos/NaiyxYin/PVZHE_MusicBox/releases/latest";
         private static readonly string[] UpdateFeedHeaders = { "User-Agent: PVZHE_MusicBox" };
 
@@ -33,31 +41,60 @@ namespace MusicBoxMod
         private NativeHttpRequest _updateRequest;
         private int _updateRetriesLeft = 1;
         private readonly List<string> _updateFailures = new();
+        // 本次启动走的是哪条渠道，日志里要写清这条结果是谁给的。
+        private string _updateChannel = ChannelGitHub;
 
         // ---------- 启动更新检测 ----------
 
-        // 每次启动只查一次：拉本仓库最新的 GitHub Release（tag 名当最新版、Release 页当下载页），
-        // 与本机模组的版本按严格 semver 相比；tag 只写版本本身，构建元数据按规范不参与比较。
+        // 每次启动按面板选的渠道走一次：只有 github 会联网，另外两档各只写一条日志说明。
         // 任何失败都只写一条日志、绝不弹窗；发现新版一律上报游戏的统一更新提醒，
-        // 老游戏没有这套通道时也只记日志说明，不自带弹窗。
+        // 老游戏没有这套通道时也只记一条日志说明。
         private void StartUpdateCheck()
         {
             if (_context == null)
                 return;
-            bool enabled = true;
+            _updateChannel = ReadUpdateChannel();
+            switch (_updateChannel)
+            {
+                case ChannelOff:
+                    _context.Log("更新检测已关闭（面板渠道=关闭）：本模组不联网，包里的官网投稿 ID 也已清掉，"
+                                 + "游戏的官网检查下次启动起不再包含本模组。");
+                    return;
+                case ChannelOfficial:
+                    _context.Log("更新检测交给游戏的官网检查（面板渠道=官网）：本模组不联网、不自行上报。");
+                    return;
+                default:
+                    StartGitHubCheck();
+                    return;
+            }
+        }
+
+        // 渠道值只认这三个：旧存档里残留的开关值、或别的 Mod 改写过配置时，宁可回到默认的 Github 也不要猜。
+        private static string NormalizeChannel(string value)
+        {
+            string text = (value ?? "").Trim();
+            return text is ChannelOff or ChannelOfficial or ChannelGitHub ? text : ChannelGitHub;
+        }
+
+        // 面板渠道 → 包里的 postId 该写什么。读不到设置（面板还没落盘之类）时按声明的默认值 Github 处理，
+        // 也就是保持绑定，不至于因为一次读取失败就把模组从官网检查里摘出去。
+        private string ReadUpdateChannel()
+        {
             try
             {
-                enabled = _settings == null || _settings.Get<bool>(UpdateCheckSetting);
+                return NormalizeChannel(_settings == null ? null : _settings.Get<string>(UpdateChannelSetting));
             }
             catch (Exception exception)
             {
-                _context.Warn("读取更新检测开关失败，按开启处理：" + exception.GetBaseException().Message);
+                _context?.Warn("读取更新检测渠道失败，按 Github 处理：" + exception.GetBaseException().Message);
+                return ChannelGitHub;
             }
-            if (!enabled)
-            {
-                _context.Log("更新检测已在配置里关闭，本次启动不检查。");
-                return;
-            }
+        }
+
+        private string DesiredPostId() => ReadUpdateChannel() == ChannelOff ? "" : OfficialPostId;
+
+        private void StartGitHubCheck()
+        {
             if (Engine.GetMainLoop() is not SceneTree tree)
                 return;
             _updateRequest = new NativeHttpRequest();
@@ -65,6 +102,9 @@ namespace MusicBoxMod
             tree.Root.AddChild(_updateRequest);
             _updateRequest.Request(UpdateFeedUrl, UpdateFeedHeaders);
         }
+
+
+
 
         // 回调已在主线程；任何意外（例如再撞上裁剪问题）都降级为一条日志，不惊扰玩家。
         private void OnUpdateRequestCompleted(long resultCode, long responseCode, string[] headers, byte[] body)
@@ -80,7 +120,8 @@ namespace MusicBoxMod
             }
         }
 
-        // 失败 3 秒后重试一轮，再失败就静默记日志收尾。
+        // github 渠道的收尾：读到合法的 Release 就按严格 semver 比大小，有新版才上报；
+        // 失败 3 秒后重试一轮，再失败就静默记日志收尾。另两条渠道根本不走这里。
         private void HandleUpdateResult(long resultCode, long responseCode, byte[] body)
         {
             if (_updateRequest == null)

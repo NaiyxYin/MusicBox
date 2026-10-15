@@ -38,7 +38,7 @@ namespace MusicBoxMod
     // 每秒的核对定时器会比对目录指纹，变了就整轮重载。
     // 所有作为“音乐”加载的音频都会强制循环播放。
     // 面板保存后 settings.Changed 会触发整轮重载并刷新已缓存的播放器，主菜单等处即时切歌。
-    // 每次启动另联网查一次版本（「关于」页 enableUpdateCheck 可关）：查本仓库最新的 GitHub Release，
+    // 每次启动按「关于」页的「检测更新渠道」下拉走一次检查（关闭 / 官网 / Github，默认 Github）：
     // 版本号一律按严格 semver 比大小（预发布排在同号正式版之前，构建元数据不比）；
     // 有新版一律上报游戏的统一更新提醒（多 Mod 汇总成一份提醒；反射探测、编译期不依赖该 API；
     // 游戏版本较旧没有这套通道时只在日志里说明，不自带弹窗）。任何失败都只在日志里说明，不打扰玩家。
@@ -1092,7 +1092,10 @@ namespace MusicBoxMod
         // 改内存里的清单宿主看不见。所以这里把两样东西写回自己安装包：
         //   ① 四个界面曲目的 options（目录里实际扫到的文件名）；
         //   ② 「关于」页 aboutChangelog 的正文（包内 changelog.txt 去掉标题行后的全部正文，
-        //      这样更新记录只维护 changelog.txt 一处，展示项自动跟上）。
+        //      这样更新记录只维护 changelog.txt 一处，展示项自动跟上）；
+        //   ③ 「关于 → 检测更新渠道=关闭」时把 postId 清空、另两档还原成仓库里绑定的投稿 ID。
+        //      游戏的官网检查只扫「包里有合法 postId」的 Mod，这是模组唯一能退出那次请求的办法；
+        //      改的是包体，游戏这次读的还是内存里的旧清单，所以效果从下一次启动起生效。
         // 代价：包体哈希变了，本局 Mod 管理会标成「正在使用旧版本，重启后更新」，点「重启并应用」即恢复。
         private void SyncPackageDeclarations(string reason)
         {
@@ -1107,7 +1110,8 @@ namespace MusicBoxMod
                 return;
 
             string changelog = ChangelogBody(ReadPackageEntry(package, ChangelogEntryName));
-            string signature = string.Join("|", tracks) + "#" + changelog;
+            string postId = DesiredPostId();
+            string signature = string.Join("|", tracks) + "#" + changelog + "#" + postId;
             if (signature == _declaredSignature)
                 return;
 
@@ -1120,7 +1124,7 @@ namespace MusicBoxMod
                     _context.Warn("安装包里没有 mod.json，跳过面板声明同步。");
                     return;
                 }
-                switch (TryBuildManifestUpdate(manifest, tracks, changelog, out string updated, out string error))
+                switch (TryBuildManifestUpdate(manifest, tracks, changelog, postId, out string updated, out string error))
                 {
                     case ManifestUpdate.Matched:
                         _declaredSignature = signature;
@@ -1142,6 +1146,8 @@ namespace MusicBoxMod
                 _context.Log($"（{reason}）配置面板已跟着更新：曲目下拉 {tracks.Count} 首"
                              + (tracks.Count == 0 ? "（空）" : "（" + string.Join("、", tracks) + "）")
                              + (string.IsNullOrEmpty(changelog) ? "，更新内容没读到" : "，更新内容已同步")
+                             + (postId.Length == 0 ? "，官网投稿绑定已清空（下次启动起不再参加游戏的官网检查）"
+                                                    : "，官网投稿仍绑 " + postId)
                              + "。本局 Mod 管理会把本模组标成旧版本，重启游戏后自动恢复。");   // 措辞对新旧宿主都成立：新宿主读作「正在使用旧版本，重启后更新」
             }
             catch (Exception exception)
@@ -1173,20 +1179,26 @@ namespace MusicBoxMod
 
         // 只动四个界面曲目项的 type/options/default，以及 aboutChangelog 的 content，其余字段原样保留。
         private ManifestUpdate TryBuildManifestUpdate(string manifest, List<string> tracks, string changelog,
-            out string updated, out string error)
+            string postId, out string updated, out string error)
         {
             updated = null;
             error = null;
             try
             {
                 JsonNode root = JsonNode.Parse(manifest);
+                bool changed = false;
+                // 渠道=关闭时这里交进来的是空串：官网检查只扫得到带 postId 的包，清空就是退出那次检查。
+                if (postId != null && TextOf(root?["postId"]) != postId)
+                {
+                    root["postId"] = postId;
+                    changed = true;
+                }
                 JsonNode settings = root?["settings"];
                 if (settings == null)
                 {
                     error = "包内 mod.json 没有 settings 数组。";
                     return ManifestUpdate.Failed;
                 }
-                bool changed = false;
                 foreach (JsonNode item in settings.AsArray())
                 {
                     string key = TextOf(item?["key"]);
