@@ -38,6 +38,7 @@ def main():
     parser = argparse.ArgumentParser(description="音乐盒构建一条龙")
     parser.add_argument("--install", action="store_true", help="打包后装进存档目录的 Mods\\（默认不装）")
     parser.add_argument("--host-dir", help="含那两份宿主程序集的目录；不给就用环境变量 PVZHOSTDIR")
+    parser.add_argument("--runtime-dir", help="可选：实际发行版裁剪 .NET DLL 目录，增加类型引用与直接方法签名形状检查")
     parser.add_argument("--probe", action="append", default=[], help="额外做一次音频预检的目录，可重复")
     args = parser.parse_args()
 
@@ -78,8 +79,16 @@ def main():
 
     run(["dotnet", "build", str(BUILD / "ModAssembly.csproj"), *build_flags,
          "-o", str(BIN)], "编译运行时 DLL")
+    if args.runtime_dir:
+        runtime_dir = str((PROJ / args.runtime_dir).resolve())
+        run(["dotnet", "run", "--project", str(BUILD / "runtimecheck"), *run_flags,
+             "-p:UseSharedCompilation=false", "--", str(BIN / "ModAssembly.dll"), runtime_dir],
+            "实际发行裁剪运行库元数据检查（非完整运行验收）")
     run(["dotnet", "run", "--project", str(BUILD / "validate"), *run_flags, "--", "mod.json"],
         "离线校验 settings 声明")
+
+    run([sys.executable, str(BUILD / "semver_probe.py")], "版本规则回归测试")
+    run([sys.executable, str(BUILD / "regression.py")], "配置与指纹回归测试")
 
     for bgm in args.probe:
         run(["dotnet", "run", "--project", str(BUILD / "probe"), *run_flags, "--", bgm],
@@ -97,7 +106,7 @@ def main():
             print("    " + line)
     print("\n[build] 全部通过。包在 %s" % (PROJ / "dist"))
     if not args.install:
-        print("[build] 全程没改过仓库里的任何文件，这一跑本身就能当流程自检用；要装机再加 --install。")
+        print("[build] 未改动源码或游戏存档；缓存和产物写入 .build/ 与 dist/。要装机再加 --install。")
 
 
 if __name__ == "__main__":

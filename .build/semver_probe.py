@@ -16,13 +16,21 @@ cases = [
     ("1.2.2+5", "1.2.2+1", 0), ("1.2.3-rc.1+7", "1.2.3-rc.1", 0),
     ("1.2.2", "1.2.2.6", -1), ("1.2.2.6", "1.2.2", 1), ("1.2.2.6", "1.2.3", -1),
     ("v1.2.3", "1.2.2", 1), ("1.2", "1.2.0", 0), ("1.2.10", "1.2.9", 1),
+    ("2147483648.0.0", "1.0.0", 1), ("1.2147483648.0", "1.2147483647.0", 1),
+    ("1.0.0-9999999999", "1.0.0-10000000000", -1),
+    ("1.0.0-9999999999", "1.0.0-alpha", -1),
+    ("1.0.0-alpha", "1.0.0-9999999999", 1),
+    ("1.0.0+001", "1.0.0+002", 0),
+    ("1.0.0-alpha", "1.0.0-alpha.1", -1), ("1.0.0-beta.11", "1.0.0-rc.1", -1),
 ]
 tags = [("1.2.3", True), ("1.2.2", True), ("1.3.0-beta.1", True), ("1.3.0-rc.12", True),
         ("1.2.3+1", True), ("1.2.3+build.1187", True), ("v1.2.3", True), ("1.2.3-alpha+build.9", True),
         ("1.2.3.0", False), ("1.2", False), ("1", False), ("01.2.3", False), ("1.2.03", False),
         ("1.2.3-", False), ("1.2.3+", False), ("1.2.3-+1", False),
         ("1.2.3-beta..1", False), ("1.2.3-01", False), ("1.2.3-beta_1", False),
-        ("latest", False), ("", False), ("1.2.3 1.2.4", False)]
+        ("latest", False), ("", False), ("1.2.3 1.2.4", False),
+         ("1.2.3+001", True), ("1.2.3+build.001", True), ("2147483648.0.0", True),
+         ("1.0.0-9999999999", True), ("1.2.3-00", False), ("1.2.3+build..1", False)]
 
 program = """
 using System;
@@ -33,22 +41,21 @@ static class Probe
 {
 %s
 
-    static void Main()
+    static int Main()
     {
         int bad = 0;
         foreach (var c in new (string, string, int)[] { %s })
         {
             int sign = CompareVersions(c.Item1, c.Item2).CompareTo(0);
             if (sign != c.Item3) { bad++; Console.WriteLine("FAIL compare [{0}] vs [{1}]: got {2} want {3}", c.Item1, c.Item2, sign, c.Item3); }
-            else Console.WriteLine("ok   compare [{0}] vs [{1}] = {2}", c.Item1, c.Item2, sign);
         }
         foreach (var t in new (string, bool)[] { %s })
         {
             bool got = IsStrictSemVer(t.Item1);
             if (got != t.Item2) { bad++; Console.WriteLine("FAIL tag [{0}]: semver={1} want {2}", t.Item1, got, t.Item2); }
-            else Console.WriteLine("ok   tag [{0}] semver={1}", t.Item1, got);
         }
         Console.WriteLine(bad == 0 ? "ALL PASS" : "FAILURES: " + bad);
+        return bad == 0 ? 0 : 1;
     }
 }
 """ % (
@@ -70,4 +77,4 @@ env = dict(os.environ)
 env.update(DOTNET_CLI_HOME=str(proj / ".build" / "tmp"),
            NUGET_PACKAGES=str(proj / ".build" / "tmp" / "nuget"),
            TEMP=str(proj / ".build" / "TEMP"), TMP=str(proj / ".build" / "TEMP"))
-sys.exit(subprocess.call(["dotnet", "run", "--project", str(work), "-c", "Release", "--nologo"], env=env, cwd=str(work)))
+sys.exit(subprocess.call(["dotnet", "run", "--project", str(work), "-c", "Release", "--nologo", "-p:UseSharedCompilation=false"], env=env, cwd=str(work)))

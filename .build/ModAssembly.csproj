@@ -19,6 +19,13 @@
   <ItemGroup>
     <Compile Include="..\Scripts\MusicBoxEntry.cs" />
     <Compile Include="..\Scripts\MusicBoxUpdate.cs" />
+    <Compile Include="..\Scripts\MusicBoxPlayer.cs" />
+    <Compile Include="..\Scripts\MusicBoxPlayerSettings.cs" />
+    <Compile Include="..\Scripts\MusicBoxPlayerGesture.cs" />
+    <Compile Include="..\Scripts\MusicBoxPlayerScenes.cs" />
+    <Compile Include="..\Scripts\MusicBoxPlaybackOrder.cs" />
+    <Compile Include="..\Scripts\MusicBoxPlayerRecovery.cs" />
+    <Compile Include="..\Scripts\MusicBoxPlayerInput.cs" />
   </ItemGroup>
 
 </Project>

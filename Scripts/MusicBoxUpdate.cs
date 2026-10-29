@@ -39,6 +39,8 @@ namespace MusicBoxMod
 
         // 更新检测的请求节点与重试状态；回调由宿主节点投递到主线程，全程不碰后台线程。
         private NativeHttpRequest _updateRequest;
+        private SceneTreeTimer _updateRetryTimer;
+        private Action _updateRetryTimeout;
         private int _updateRetriesLeft = 1;
         private readonly List<string> _updateFailures = new();
         // 本次启动走的是哪条渠道，日志里要写清这条结果是谁给的。
@@ -51,8 +53,10 @@ namespace MusicBoxMod
         // 老游戏没有这套通道时也只记一条日志说明。
         private void StartUpdateCheck()
         {
-            if (_context == null)
+            if (!_running || _context == null)
                 return;
+            _updateRetriesLeft = 1;
+            _updateFailures.Clear();
             _updateChannel = ReadUpdateChannel();
             switch (_updateChannel)
             {
@@ -86,7 +90,7 @@ namespace MusicBoxMod
             }
             catch (Exception exception)
             {
-                _context?.Warn("读取更新检测渠道失败，按 Github 处理：" + exception.GetBaseException().Message);
+                WarnOnce("更新渠道", "读取更新检测渠道失败，按 Github 处理：" + exception.GetBaseException().Message);
                 return ChannelGitHub;
             }
         }
@@ -124,7 +128,7 @@ namespace MusicBoxMod
         // 失败 3 秒后重试一轮，再失败就静默记日志收尾。另两条渠道根本不走这里。
         private void HandleUpdateResult(long resultCode, long responseCode, byte[] body)
         {
-            if (_updateRequest == null)
+            if (!_running || _updateRequest == null)
                 return;
             string problem = null;
             if (resultCode == (long)NativeHttpRequest.Result.Success && responseCode == 200
@@ -136,14 +140,12 @@ namespace MusicBoxMod
                 if (CompareVersions(latest, current) > 0)
                 {
                     if (TryReportToHostUpdates(latest, current, url))
-                        _context?.Log($"更新检测：发现新版本 v{latest}（当前 v{current}），已交给游戏的统一更新提醒。");
+                        _context?.Log($"更新检测：发现新版本 v{latest}（当前 v{current}），已提交游戏统一更新服务（显示由游戏决定）。");
                     else
                         _context?.Log($"更新检测：发现新版本 v{latest}（当前 v{current}），但当前游戏没有统一更新提醒，本模组不自行弹窗。");
                 }
                 else
-                {
-                    _context?.Log($"更新检测：当前 v{current} 已是最新（服务器 v{latest}）。");
-                }
+                    ReportHostUpToDate();
                 return;
             }
             problem ??= resultCode != (long)NativeHttpRequest.Result.Success
@@ -154,12 +156,26 @@ namespace MusicBoxMod
             _updateFailures.Add(problem);
             if (_updateRetriesLeft-- > 0 && Engine.GetMainLoop() is SceneTree tree)
             {
-                var timer = tree.CreateTimer(3.0);
-                timer.Timeout += () =>
+                int generation = _generation;
+                _updateRetryTimer = tree.CreateTimer(3.0);
+                _updateRetryTimeout = () =>
                 {
-                    if (_updateRequest != null)
-                        _updateRequest.Request(UpdateFeedUrl, UpdateFeedHeaders);
+                    if (!_running || generation != _generation)
+                        return;
+                    _updateRetryTimer = null;
+                    _updateRetryTimeout = null;
+                    try
+                    {
+                        if (_updateRequest != null)
+                            _updateRequest.Request(UpdateFeedUrl, UpdateFeedHeaders);
+                    }
+                    catch (Exception exception)
+                    {
+                        FinishUpdateRequest();
+                        _context?.Warn("更新检测重试失败：" + exception.GetBaseException().Message);
+                    }
                 };
+                _updateRetryTimer.Timeout += _updateRetryTimeout;
                 return;
             }
             FinishUpdateRequest();
@@ -168,6 +184,10 @@ namespace MusicBoxMod
 
         private void FinishUpdateRequest()
         {
+            if (GodotObject.IsInstanceValid(_updateRetryTimer) && _updateRetryTimeout != null)
+                _updateRetryTimer.Timeout -= _updateRetryTimeout;
+            _updateRetryTimer = null;
+            _updateRetryTimeout = null;
             if (_updateRequest == null)
                 return;
             _updateRequest.RequestCompleted -= OnUpdateRequestCompleted;
@@ -232,16 +252,17 @@ namespace MusicBoxMod
         // 「+构建元数据」按规范整个丢掉不比——所以同一个版的第 1 次和第 5 次构建都不会互相提示有更新。
         private static int CompareVersions(string left, string right)
         {
-            ParseSemVer(left, out int[] a, out string[] aPre);
-            ParseSemVer(right, out int[] b, out string[] bPre);
+            ParseSemVer(left, out string[] a, out string[] aPre);
+            ParseSemVer(right, out string[] b, out string[] bPre);
             // 缺的那段按 0 补：tag 写 1.2 与本机 1.2.0 视为同一版；
             // 换成 semver 之前发出去的四位老包（1.2.2.6）也照样读，多出来那段留在数字段里按位置比。
             for (int index = 0; index < Math.Max(a.Length, b.Length); index++)
             {
-                int x = index < a.Length ? a[index] : 0;
-                int y = index < b.Length ? b[index] : 0;
-                if (x != y)
-                    return x.CompareTo(y);
+                string x = index < a.Length ? a[index] : "0";
+                string y = index < b.Length ? b[index] : "0";
+                int result = CompareNumericIdentifiers(x, y);
+                if (result != 0)
+                    return result;
             }
             return ComparePrerelease(aPre, bPre);
         }
@@ -249,7 +270,7 @@ namespace MusicBoxMod
         // 拆一个版本号：'+' 之后整段丢弃，第一个 '-' 之后是预发布标记，剩下的是点分的数字段。
         // 逐字符扫描而不是用 Split 重载：三字符的 Split 会被编译器绑到 String.Split(ReadOnlySpan<char>)，
         // 而那个重载在裁剪后的游戏运行时里不存在。
-        private static void ParseSemVer(string version, out int[] numeric, out string[] prerelease)
+        private static void ParseSemVer(string version, out string[] numeric, out string[] prerelease)
         {
             string text = (version ?? "").Trim().TrimStart('v', 'V');
             int plus = text.IndexOf('+');
@@ -260,12 +281,12 @@ namespace MusicBoxMod
             if (hyphen >= 0)
                 text = text.Substring(0, hyphen);
 
-            var numbers = new List<int>();
+            var numbers = new List<string>();
             foreach (string token in CutAtDots(text))
             {
-                if (!TryReadNumber(token, out int value))
+                if (!IsNumericIdentifier(token))
                     break;
-                numbers.Add(value);
+                numbers.Add(token);
             }
             numeric = numbers.ToArray();
             prerelease = labels.Length == 0 ? Array.Empty<string>() : CutAtDots(labels);
@@ -279,10 +300,10 @@ namespace MusicBoxMod
                 return left.Length == right.Length ? 0 : left.Length == 0 ? 1 : -1;
             for (int index = 0; index < Math.Min(left.Length, right.Length); index++)
             {
-                bool leftNumber = TryReadNumber(left[index], out int x);
-                bool rightNumber = TryReadNumber(right[index], out int y);
+                bool leftNumber = IsNumericIdentifier(left[index]);
+                bool rightNumber = IsNumericIdentifier(right[index]);
                 int result = leftNumber && rightNumber
-                    ? x.CompareTo(y)
+                    ? CompareNumericIdentifiers(left[index], right[index])
                     : leftNumber != rightNumber
                         ? (leftNumber ? -1 : 1)
                         : string.CompareOrdinal(left[index], right[index]);
@@ -315,7 +336,7 @@ namespace MusicBoxMod
             // 按分隔符在不在来验，而不是按内容长不长：`1.2.3-`、`1.2.3+` 这种空尾巴同样不规范。
             if (hyphen >= 0 && !IsIdentifierList(prerelease))
                 return false;
-            return plus < 0 || IsIdentifierList(build);
+            return plus < 0 || IsIdentifierList(build, allowLeadingZeros: true);
         }
 
         // 主/次/补丁那一段：全数字，且不许「01」这种前导零写法。
@@ -326,11 +347,11 @@ namespace MusicBoxMod
                 && text.All(char.IsAsciiDigit);
         }
 
-        // 预发布 / 构建元数据的点分标识符列表：每段非空、只用 ASCII 字母数字和 '-'，纯数字段同样不许前导零。
-        private static bool IsIdentifierList(string text)
+        // 预发布数字段禁止前导零，构建元数据允许；两者都只接受非空 ASCII 标识符。
+        private static bool IsIdentifierList(string text, bool allowLeadingZeros = false)
         {
             return CutAtDots(text).All(item => item.Length > 0 && item.All(IsIdentifierChar)
-                && !(item.All(char.IsAsciiDigit) && item.Length > 1 && item[0] == '0'));
+                && (allowLeadingZeros || !(item.All(char.IsAsciiDigit) && item.Length > 1 && item[0] == '0')));
         }
 
         private static bool IsIdentifierChar(char value) =>
@@ -355,57 +376,98 @@ namespace MusicBoxMod
             return items.ToArray();
         }
 
-        private static bool TryReadNumber(string token, out int value)
+        private static bool IsNumericIdentifier(string text) =>
+            text.Length > 0 && text.All(char.IsAsciiDigit);
+
+        // SemVer 数字没有 Int32 上限；去掉兼容旧版本的前导零后按长度和字典序比较。
+        private static int CompareNumericIdentifiers(string left, string right)
         {
-            value = 0;
-            if (token.Length == 0)
-                return false;
-            for (int index = 0; index < token.Length; index++)
-            {
-                if (!char.IsAsciiDigit(token[index]))
-                    return false;
-                long next = value * 10L + (token[index] - '0');
-                if (next > int.MaxValue)
-                    return false;
-                value = (int)next;
-            }
-            return true;
+            string a = left.TrimStart('0');
+            string b = right.TrimStart('0');
+            int length = a.Length.CompareTo(b.Length);
+            return length != 0 ? length : string.CompareOrdinal(a, b);
         }
 
-        // 桥接游戏的统一更新提醒（宿主的 XWModRuntimeContext.Updates）：多个 Mod 的更新由游戏
-        // 汇总成一份更新列表、一次弹窗，免得各弹各的。当前流传的游戏客户端还没有这套 API，
-        // 也不该让模组程序集绑死宿主 DLL 的新旧，所以整段走运行时反射——通道在就上报，
-        // 缺就返回 false，由调用方只记一条日志（发现新版一律以统一接口为准，不自带弹窗）。
-        // 上报在主线程直接调用即可，宿主自己排队受理；回执是异步的，这里不等它。
-        private bool TryReportToHostUpdates(string latest, string current, string url)
+        // 桥接游戏的统一更新提醒：新宿主走公开 Updates 服务；旧发行仅此兼容层使用反射。
+        // 按 XWModUpdateService 契约在 Initialize 主线程取得服务，不在网络回调首次创建。
+        private object _hostUpdates;
+        private System.Reflection.MethodInfo _reportAvailable;
+        private System.Reflection.MethodInfo _reportUpToDate;
+
+        private void PrepareHostUpdates()
         {
-            if (_context == null)
-                return false;
+            _hostUpdates = null;
+            _reportAvailable = null;
+            _reportUpToDate = null;
             try
             {
-                System.Reflection.PropertyInfo updatesProperty = _context.GetType().GetProperty("Updates");
-                if (updatesProperty == null)
-                    return false;
-                object service = updatesProperty.GetValue(_context);
-                if (service == null)
-                    return false;
-                System.Reflection.MethodInfo reportMethod = service.GetType().GetMethod("ReportAvailableAsync");
-                if (reportMethod == null)
-                    return false;
-                System.Reflection.ParameterInfo[] parameters = reportMethod.GetParameters();
-                if (parameters.Length != 1)
-                    return false;
-                object notice = Activator.CreateInstance(
-                    parameters[0].ParameterType, latest, $"当前 v{current}，可前往下载页更新。", url);
-                if (notice == null)
-                    return false;
-                reportMethod.Invoke(service, new object[] { notice });
-                return true;
+                var property = _context.GetType().GetProperty("Updates");
+                if (property == null) return;
+                _hostUpdates = property.GetValue(_context);
+                _reportAvailable = _hostUpdates?.GetType().GetMethod("ReportAvailableAsync");
+                _reportUpToDate = _hostUpdates?.GetType().GetMethod("ReportUpToDateAsync");
             }
             catch (Exception exception)
             {
-                _context?.Warn("统一更新提醒上报失败（不影响游戏）：" + exception.GetBaseException().Message);
+                WarnOnce("更新服务初始化", "统一更新服务不可用：" + exception.GetBaseException().Message);
+            }
+        }
+
+        private bool TryReportToHostUpdates(string latest, string current, string url)
+        {
+            if (!_running || _hostUpdates == null || _reportAvailable == null)
                 return false;
+            try
+            {
+                var parameters = _reportAvailable.GetParameters();
+                if (parameters.Length != 1) return false;
+                object notice = Activator.CreateInstance(parameters[0].ParameterType,
+                    latest, $"当前 v{current}，可前往下载页更新。", url);
+                return ObserveHostUpdateReceipt(_reportAvailable.Invoke(_hostUpdates, new[] { notice }));
+            }
+            catch (Exception exception)
+            {
+                WarnOnce("更新上报", "统一更新提醒上报失败：" + exception.GetBaseException().Message);
+                return false;
+            }
+        }
+
+        private void ReportHostUpToDate()
+        {
+            // 仅用于请求成功且版本比较确认无更新；关闭、超时、格式错误不允许冒报“已是最新”。
+            if (!_running || _hostUpdates == null || _reportUpToDate == null) return;
+            try { ObserveHostUpdateReceipt(_reportUpToDate.Invoke(_hostUpdates, null)); }
+            catch (Exception exception)
+            {
+                WarnOnce("更新无新版上报", "更新状态上报失败：" + exception.GetBaseException().Message);
+            }
+        }
+
+        private bool ObserveHostUpdateReceipt(object receipt)
+        {
+            if (receipt is not System.Threading.Tasks.Task task) return false;
+            ObserveHostUpdateReceiptAsync(task, _generation);
+            return true; // 只表示已提交，不能声称弹窗已经显示。
+        }
+
+        private async void ObserveHostUpdateReceiptAsync(System.Threading.Tasks.Task task, int generation)
+        {
+            try
+            {
+                // 从 Godot 主线程进入并保留其同步上下文，完成后才读取受理回执。
+                await task;
+                if (!_running || generation != _generation) return;
+                object result = task.GetType().GetProperty("Result")?.GetValue(task);
+                if (result?.GetType().GetProperty("Succeeded")?.GetValue(result) is not true)
+                {
+                    string diagnostic = result?.GetType().GetProperty("Diagnostic")?.GetValue(result) as string;
+                    WarnOnce("更新回执", "统一更新服务未受理：" + (diagnostic ?? "没有成功回执"));
+                }
+            }
+            catch (Exception exception)
+            {
+                if (_running && generation == _generation)
+                    WarnOnce("更新回执", "统一更新回执失败：" + exception.GetBaseException().Message);
             }
         }
     }

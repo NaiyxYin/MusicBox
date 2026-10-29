@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "modId": "MusicBox",
+  "placements": {
+    "main-menu/record/player": {"anchorX": "right", "anchorY": "bottom", "rightInset": 24, "verticalInset": 96}
+  }
+}

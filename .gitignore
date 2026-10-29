@@ -12,7 +12,8 @@
 dist/
 
 # 本地音频素材：版权不在本仓库，包内也不带音频
-Assets/
+Assets/*
+!Assets/ui-layout.json
 
 # 本地准备的宿主程序集：游戏的编译产物，只在编译期引用，绝不进仓库
 .build/host/

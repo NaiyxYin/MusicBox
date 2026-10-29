@@ -87,6 +87,8 @@ namespace MusicBoxMod
             ("menuShop", "Shop"),
             ("menuLevelChoose", "LevelChoose"),
             ("menuAlmanac", "Almanac"),
+            ("menuLevelEditorStage", "LevelEditorStage"),
+            ("menuAwardSettlement", "AwardSettlement"),
         };
 
         // 面板项 -> 所属组的总开关键；开关为 false 时该项按「原版（不替换）」处理。
@@ -97,7 +99,11 @@ namespace MusicBoxMod
                 ["menuShop"] = MenuGroupSwitch,
                 ["menuLevelChoose"] = LevelGroupSwitch,
                 ["menuAlmanac"] = LevelGroupSwitch,
+                ["menuLevelEditorStage"] = LevelGroupSwitch,
+                ["menuAwardSettlement"] = LevelGroupSwitch,
             };
+
+        private const string PlayerVisibleSetting = "showMenuPlayer";
 
         private enum ScreenMode
         {
@@ -119,8 +125,10 @@ namespace MusicBoxMod
             new(StringComparer.OrdinalIgnoreCase)
             {
                 ["MainMenu"]    = new ScreenDef(ScreenMode.KeyOverride, "MainMenu", null),
-                ["Almanac"]     = new ScreenDef(ScreenMode.KeyOverride, "ChooseYourSeeds", null),
+                ["Almanac"]     = new ScreenDef(ScreenMode.SceneSwap, "ChooseYourSeeds", null),
                 ["LevelChoose"] = new ScreenDef(ScreenMode.SceneSwap, "ZenGarden", null),
+                ["LevelEditorStage"] = new ScreenDef(ScreenMode.SceneSwap, "ZenGarden", null),
+                ["AwardSettlement"] = new ScreenDef(ScreenMode.SceneSwap, "ZenGarden", null),
                 ["Shop"]        = new ScreenDef(ScreenMode.DialogHook, "MainMenu", "MainMenu"),
             };
 
@@ -145,6 +153,19 @@ namespace MusicBoxMod
         private XWModRuntimeContext _context;
         private XWModSettings _settings;
         private bool _settingsSubscribed;
+        private bool _running;
+        private int _generation;
+        private SceneTreeTimer _panelTimer;
+        private Action _panelTimeout;
+        private string _pendingMusicStamp;
+        private readonly Dictionary<Node, Action> _screenExits = new();
+        private sealed class CachedAudio
+        {
+            public string Stamp;
+            public AudioStream Stream;
+        }
+        private readonly Dictionary<string, CachedAudio> _audioCache = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, AudioStream> _keyApplied = new();
         // 上一次应用时读到的面板值指纹，用于「通知没来但值已经变了」时兜底重载。
         private string _appliedSignature = "";
         // 面板落盘值的自取副本（见 SyncStoredPanelValues 的说明）。
@@ -188,18 +209,36 @@ namespace MusicBoxMod
         // 已经写进安装包里的那份声明指纹（曲目 + 更新内容），用于避免每次核对目录都重写一遍包
         // （见 SyncPackageDeclarations）。
         private string _declaredSignature = "";
+        private string _packageHash;
 
         public void Initialize(XWModRuntimeContext context)
         {
+            if (_running)
+                Shutdown();
             _context = context;
-            context?.Log($"运行入口已加载 v{context.ModVersion}");
+            _running = true;
+            _generation++;
+            // 初始化结束后宿主会冻结 Lifetime；预先登记统一清理，运行时不再向根作用域 Track。
+            context.Lifetime.Track(Shutdown);
+            PrepareHostUpdates();
+            ReserveDialogAudioKeys();
+            InitializeMenuPlayer();
+            _panelStamp = DateTime.MinValue;
+            _musicStamp = "";
+            _pendingMusicStamp = null;
+            _declaredSignature = "";
+            _packageHash = null;
+            _resumeWatchFailed = false;
+            _warnedFiles.Clear();
+            _panelScalar.Clear();
+            _panelBool.Clear();
             try
             {
                 _settings = context.Settings;
             }
             catch (Exception exception)
             {
-                _context.Warn("原生 Mod 配置不可用：" + exception.GetBaseException().Message);
+                _context?.Warn("原生 Mod 配置不可用：" + exception.GetBaseException().Message);
             }
             try
             {
@@ -213,10 +252,14 @@ namespace MusicBoxMod
 
         public void OnAllModsLoaded()
         {
+            if (!_running || _hooked)
+                return;
             try
             {
+                RefreshStoredValues();
                 ApplyRegistrations();
                 HookSceneEvents();
+                _context?.Log($"音乐盒 v{_context.ModVersion}：曲目={_slots.Count}，战斗覆盖={_bgmOverrides.Count}，界面替换={_menuEntries.Count}");
                 SubscribeSettings();
                 StartPanelWatch();
                 SyncPackageDeclarations("启动");
@@ -230,17 +273,42 @@ namespace MusicBoxMod
 
         public void Shutdown()
         {
+            if (!_running)
+                return;
+            _running = false;
+            _hostUpdates = null;
+            _reportAvailable = null;
+            _reportUpToDate = null;
+            _generation++;
+            if (GodotObject.IsInstanceValid(_panelTimer) && _panelTimeout != null)
+                _panelTimer.Timeout -= _panelTimeout;
+            _panelTimer = null;
+            _panelTimeout = null;
+            _menuPlayer?.Dispose();
+            _playerScope?.Cleanup(); _playerMount = null; _playerScope = null;
+            RestoreActiveDialogs();
             UnsubscribeSettings();
             UnhookSceneEvents();
             FinishUpdateRequest();
             foreach (SceneSwap swap in _sceneSwaps)
                 RestoreSceneSwap(swap);
+            var restoreKeys = new List<string>(_ownedKeys);
+            RestoreMusicKeys(restoreKeys);
+            foreach (string key in _appliedMusicKeys.Concat(restoreKeys).Distinct())
+                if (!RefreshMusicMember(key))
+                    StopMusicMember(key);
+            _audioCache.Clear();
+            _appliedMusicKeys.Clear();
+            _slots.Clear();
+            _blockedSlots.Clear();
+            _settings = null;
             _bgmOverrides.Clear();
             _menuEntries.Clear();
             _sceneSwaps.Clear();
             _dialogHooks.Clear();
             _ownedKeys.Clear();
             _keyOriginals.Clear();
+            _keyApplied.Clear();
         }
 
         // ---------- 配置加载 ----------
@@ -250,49 +318,62 @@ namespace MusicBoxMod
             if (_context == null)
                 return;
 
-            _bgmOverrides.Clear();
-            _slots.Clear();
-            _blockedSlots.Clear();
+            // 扫描和解码先放临时集合，目录不可读或复制未结束时不破坏已应用的状态。
+            var slots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var blocked = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var overrides = new List<(string Key, AudioStream Stream)>();
+            string stamp = MusicStamp();
 
             string bgmDir = ProjectSettings.GlobalizePath(BgmRootVirtualPath);
             if (!Directory.Exists(bgmDir))
-                _context.Warn($"BGM 目录不存在，全部界面保持原版：{bgmDir}");
+                WarnOnce("目录不存在", $"BGM 目录不存在，全部界面保持原版：{bgmDir}");
 
             // 两遍扫：先收游戏能读的，再处理读不了的。同一首两个版本同时放着时（比如 .flac + .mp3），
             // 能读的那份一定赢，不会因为文件名排序在前就被误报成「读不了」。
             var rejected = new List<(string Name, string File, string Why)>();
-            foreach (string file in EnumerateAudioFiles(bgmDir))
+            string[] files = EnumerateFiles(bgmDir).OrderBy(file => file, StringComparer.Ordinal).ToArray();
+            foreach (string file in files.Where(IsAudioFile))
             {
                 string name = Path.GetFileNameWithoutExtension(file).Trim();
                 if (name.Length == 0)
                     continue;
+                if (string.Equals(name, OffOption, StringComparison.OrdinalIgnoreCase))
+                {
+                    WarnOnce("保留曲名 " + file, $"{file} 使用了保留曲名 off，请重命名后再选择。");
+                    continue;
+                }
                 string rejection = DescribeAudioRejection(file);
                 if (rejection != null)
                 {
                     rejected.Add((name, file, rejection));
                     continue;
                 }
-                if (!_slots.TryAdd(name, file))
+                if (!slots.TryAdd(name, file))
                 {
-                    _context.Warn($"{name} 有多份同名音频，用先扫到的 {_slots[name]}，忽略 {file}");
+                    WarnOnce("重名 " + file, $"{name} 有多份同名音频，用先扫到的 {slots[name]}，忽略 {file}");
                     continue;
                 }
                 // 文件名正好是战斗 BGM 键：它既是一个可选曲目，也顺手覆盖那个键。
                 if (BattleBgmKeys.Contains(name))
-                    AddLoadedStream(_bgmOverrides, name, file, loop: true);
+                {
+                    AudioStream stream = LoadAudio(file, loop: true);
+                    if (stream == null)
+                        throw new InvalidDataException("战斗音频暂时无法加载，保留当前播放状态：" + file);
+                    overrides.Add((name, stream));
+                }
             }
             foreach ((string name, string file, string why) in rejected)
             {
-                if (_slots.ContainsKey(name))
+                if (slots.ContainsKey(name))
                     continue;
-                _blockedSlots[name] = why;
+                blocked[name] = why;
                 WarnOnce("屏蔽 " + name + " " + why,
                     $"{name} 游戏读不了（{why}），所以没列进选曲下拉：{file}。"
                     + "转成 16-bit 立体声、64MB 以内的文件就行（ogg / mp3 最省事）。");
             }
 
             // 游戏压根没有解码器的格式：不认作曲目，只说明一次，免得玩家纳闷文件为什么不在下拉里。
-            foreach (string file in EnumerateFiles(bgmDir))
+            foreach (string file in files)
             {
                 string extension = Path.GetExtension(file);
                 if (!UnscannedAudioExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase))
@@ -302,8 +383,15 @@ namespace MusicBoxMod
                     + "转成 ogg 或 mp3 再放进来就能选。");
             }
 
-            _musicStamp = MusicStamp();
-            _context.Log($"扫描 {bgmDir}：可选曲目={_slots.Count} 战斗BGM覆盖={_bgmOverrides.Count}");
+            if (MusicStamp() != stamp)
+                throw new IOException("音乐目录仍在写入，稍后重试。");
+            _slots.Clear();
+            foreach (var pair in slots) _slots.Add(pair.Key, pair.Value);
+            _blockedSlots.Clear();
+            foreach (var pair in blocked) _blockedSlots.Add(pair.Key, pair.Value);
+            _bgmOverrides.Clear();
+            _bgmOverrides.AddRange(overrides);
+            _musicStamp = stamp;
         }
 
         // 递归扫描：玩家可以在 BGM 下自建子文件夹分类，非音频文件（如 .rez）自然被排除。
@@ -311,13 +399,17 @@ namespace MusicBoxMod
         {
             if (!Directory.Exists(dir))
                 return Enumerable.Empty<string>();
-            return Directory.GetFiles(dir, "*", SearchOption.AllDirectories);
+            return Directory.EnumerateFiles(dir, "*", new EnumerationOptions
+            { RecurseSubdirectories = true, IgnoreInaccessible = false, AttributesToSkip = FileAttributes.ReparsePoint });
         }
+
+        private static bool IsAudioFile(string file) =>
+            AudioExtensions.Contains(Path.GetExtension(file), StringComparer.OrdinalIgnoreCase);
 
         private static IEnumerable<string> EnumerateAudioFiles(string dir)
         {
             return EnumerateFiles(dir)
-                .Where(file => AudioExtensions.Contains(Path.GetExtension(file), StringComparer.OrdinalIgnoreCase))
+                .Where(IsAudioFile)
                 .OrderBy(file => file, StringComparer.Ordinal);
         }
 
@@ -454,13 +546,19 @@ namespace MusicBoxMod
             _context?.Warn(message);
         }
 
-        // BGM 根目录的指纹（文件名 + 写入时间）。丢或换文件后不必重启。
+        // 指纹包含完整路径、大小和时间；长度前缀避免文件名中的分隔符造成碰撞。
         private static string MusicStamp()
         {
-            string stamp = "";
+            var stamp = new StringBuilder();
             foreach (string file in EnumerateAudioFiles(ProjectSettings.GlobalizePath(BgmRootVirtualPath)))
-                stamp += Path.GetFileNameWithoutExtension(file) + ':' + File.GetLastWriteTimeUtc(file).Ticks + ';';
-            return stamp;
+                stamp.Append(file.Length).Append(':').Append(file).Append(':').Append(AudioFileStamp(file)).Append(';');
+            return stamp.ToString();
+        }
+
+        private static string AudioFileStamp(string file)
+        {
+            var info = new FileInfo(file);
+            return info.Length + ":" + info.LastWriteTimeUtc.Ticks;
         }
 
         // ---------- 面板选项 -> 音频 ----------
@@ -468,9 +566,12 @@ namespace MusicBoxMod
         // 依据原生 Mod 配置的当前值挑选音频。清掉上一轮的界面结果，战斗 BGM 覆盖保持独立。
         private void BuildSelections()
         {
-            _menuEntries.Clear();
+            var selections = new List<(string Screen, AudioStream Stream)>();
             if (_settings == null)
+            {
+                _menuEntries.Clear();
                 return;
+            }
 
             foreach ((string setting, string screen) in ScreenSettings)
             {
@@ -483,18 +584,20 @@ namespace MusicBoxMod
                 if (file == null)
                 {
                     if (_blockedSlots.TryGetValue(track, out string why))
-                        _context?.Warn($"{track} 游戏读不了（{why}），界面 {screen} 保持原版。"
+                        WarnOnce("选曲屏蔽 " + screen + track + why, $"{track} 游戏读不了（{why}），界面 {screen} 保持原版。"
                                        + "转成 16-bit 立体声、64MB 以内的文件（ogg / mp3 最省事），重启游戏后重新选它。");
                     else
-                        _context?.Warn($"{BgmRootVirtualPath}（含子文件夹）下没有 {track}.*，界面 {screen} 保持原版。");
+                        WarnOnce("选曲缺失 " + screen + track, $"{BgmRootVirtualPath}（含子文件夹）下没有 {track}.*，界面 {screen} 保持原版。");
                     continue;
                 }
                 AudioStream stream = LoadAudio(file, loop: true);
-                if (stream != null)
-                    _menuEntries.Add((screen, stream));
+                if (stream == null)
+                    throw new InvalidDataException("选中音频暂时无法加载，保留当前播放状态：" + file);
+                selections.Add((screen, stream));
             }
 
-            _context?.Log($"面板值：{PanelSignature()}｜已取到音频 界面={_menuEntries.Count}");
+            _menuEntries.Clear();
+            _menuEntries.AddRange(selections);
         }
 
         // 面板当前生效值的可读指纹，既用于日志自证，也用于漂移检测。
@@ -518,7 +621,7 @@ namespace MusicBoxMod
             }
             catch (Exception exception)
             {
-                _context?.Warn($"读取配置项失败 {key}：{exception.GetBaseException().Message}");
+                WarnOnce("配置项 " + key, $"读取配置项失败 {key}：{exception.GetBaseException().Message}");
                 return null;
             }
         }
@@ -536,7 +639,7 @@ namespace MusicBoxMod
             }
             catch (Exception exception)
             {
-                _context?.Warn($"读取开关失败 {switchKey}：{exception.GetBaseException().Message}");
+                WarnOnce("配置开关 " + switchKey, $"读取开关失败 {switchKey}：{exception.GetBaseException().Message}");
                 return true;
             }
         }
@@ -566,6 +669,11 @@ namespace MusicBoxMod
                 return null;
             }
 
+            string stamp = AudioFileStamp(absolute);
+            if (_audioCache.TryGetValue(absolute, out CachedAudio cached)
+                && cached.Stamp == stamp && GodotObject.IsInstanceValid(cached.Stream))
+                return cached.Stream;
+
             // 宿主按扩展名挑解码器，所以交给它的是文件内容真正的格式，不是文件名上写的那个。
             var head = new byte[12];
             int filled = Math.Max(0, ReadFileHead(absolute, head));
@@ -576,12 +684,15 @@ namespace MusicBoxMod
                     absolute, realExtension, out AudioStream stream, out string diagnostic)
                 && GodotObject.IsInstanceValid(stream))
             {
+                if (AudioFileStamp(absolute) != stamp)
+                    throw new IOException("音频仍在写入：" + absolute);
                 if (loop)
                     ForceLoop(stream);
+                _audioCache[absolute] = new CachedAudio { Stamp = stamp, Stream = stream };
                 return stream;
             }
 
-            _context?.Warn($"音频加载失败 {absolute}：{diagnostic}。"
+            WarnOnce("加载 " + absolute + stamp, $"音频加载失败 {absolute}：{diagnostic}。"
                            + (realExtension.Equals(extension, StringComparison.OrdinalIgnoreCase)
                                ? ""
                                : $"文件名写着 {extension}，里面其实是 {realExtension}；")
@@ -611,14 +722,16 @@ namespace MusicBoxMod
 
         // ---------- 注册与应用 ----------
 
-        private void ApplyRegistrations()
+        private void ApplyRegistrations(bool rebuildSelections = true)
         {
+            _menuPlayer?.ResetPlayback();
             // 内容结构在宿主加载完 Mod 后就冻结了，重载时不能再注册新键；
             // 所以本模组占用的键一律原地改写 AUDIOS，并记下原版音频供还原。
+            if (rebuildSelections)
+                BuildSelections();
             var ownedBefore = new List<string>(_ownedKeys);
             _ownedKeys.Clear();
             _appliedMusicKeys.Clear();
-            BuildSelections();
 
             foreach ((string key, AudioStream stream) in _bgmOverrides)
                 if (SetMusicKey(key, stream))
@@ -668,6 +781,10 @@ namespace MusicBoxMod
             }
 
             _appliedSignature = PanelSignature();
+            var used = new HashSet<AudioStream>(_bgmOverrides.Select(pair => pair.Stream).Concat(_menuEntries.Select(pair => pair.Stream)));
+            foreach (string file in _audioCache.Keys.ToArray())
+                if (!used.Contains(_audioCache[file].Stream))
+                    _audioCache.Remove(file);
         }
 
         private bool SetMusicKey(string key, AudioStream stream)
@@ -676,7 +793,9 @@ namespace MusicBoxMod
             if (string.IsNullOrWhiteSpace(key) || stream == null || manager == null)
                 return false;
 
-            if (!_keyOriginals.ContainsKey(key))
+            if (!_keyOriginals.ContainsKey(key)
+                || (_keyApplied.TryGetValue(key, out AudioStream previous)
+                    && manager.AUDIOS.TryGetValue(key, out Resource current) && !ReferenceEquals(current, previous)))
             {
                 manager.AUDIOS.TryGetValue(key, out Resource original);
                 _keyOriginals[key] = original;
@@ -684,14 +803,12 @@ namespace MusicBoxMod
             if (manager.AUDIOS.ContainsKey(key))
             {
                 manager.AUDIOS[key] = stream;
+                _keyApplied[key] = stream;
                 _ownedKeys.Add(key);
                 return true;
             }
-            if (Register(key, stream, false))
-            {
-                _ownedKeys.Add(key);
-                return true;
-            }
+            // 注册表此时已冻结；缺键是初始化/宿主兼容问题，不在热重载时偷注册。
+            WarnOnce("音频键缺失 " + key, "音频键未在初始化阶段就绪，跳过替换：" + key);
             _keyOriginals.Remove(key);
             return false;
         }
@@ -703,23 +820,26 @@ namespace MusicBoxMod
                 return;
             foreach (string key in keys)
             {
-                _keyOriginals.TryGetValue(key, out Resource original);
-                if (original == null)
-                    manager.AUDIOS.Remove(key);
-                else
-                    manager.AUDIOS[key] = original;
+                // 其他模组已接管的键不再覆盖回本模组保存的旧值。
+                if (_keyApplied.TryGetValue(key, out AudioStream applied)
+                    && manager.AUDIOS.TryGetValue(key, out Resource current) && ReferenceEquals(current, applied))
+                {
+                    _keyOriginals.TryGetValue(key, out Resource original);
+                    if (original == null)
+                        manager.AUDIOS.Remove(key);
+                    else
+                        manager.AUDIOS[key] = original;
+                }
                 _keyOriginals.Remove(key);
-                _context?.Log($"已还原原版音频：{key}");
+                _keyApplied.Remove(key);
             }
         }
 
         private void RefreshAppliedMusicMembers()
         {
-            int refreshed = 0;
-            foreach (string key in _appliedMusicKeys)
-                if (RefreshMusicMember(key))
-                    refreshed++;
-            _context?.Log($"已刷新常驻播放器 {refreshed}/{_appliedMusicKeys.Count}（未计入的键对应界面当前没打开）");
+            foreach (string key in _appliedMusicKeys.Distinct())
+                if (!RefreshMusicMember(key))
+                    StopMusicMember(key);
         }
 
         private bool RefreshMusicMember(string key)
@@ -737,12 +857,13 @@ namespace MusicBoxMod
                 AudioStreamPlayerMember member = audio.MemberFind(key, AudioManagerEnum.TYPE.MUSIC);
                 if (!GodotObject.IsInstanceValid(member))
                     return false;
+                if (ReferenceEquals(member.Stream, stream))
+                    return true;
                 bool wasPlaying = member.IsPlaying();
                 member.Stop();
                 member.Stream = stream;
                 if (wasPlaying)
                     member.Play();
-                _context?.Log($"即时换曲 {key}：新音频长度={stream.GetLength():0.0}s 原本在播={wasPlaying}");
                 return true;
             }
             catch (Exception exception)
@@ -752,13 +873,37 @@ namespace MusicBoxMod
             }
         }
 
+        private void StopMusicMember(string key)
+        {
+            try
+            {
+                var member = AudioManager.Instance?.MemberFind(key, AudioManagerEnum.TYPE.MUSIC);
+                if (GodotObject.IsInstanceValid(member))
+                {
+                    member.Stop();
+                    member.Stream = null;
+                }
+            }
+            catch (Exception exception)
+            {
+                WarnOnce("停止播放器 " + key, $"停止播放器失败 {key}：{exception.GetBaseException().Message}");
+            }
+        }
+
+        // 新内容只能在 Initialize 注册。先占位，之后设置切歌只替换已存在键的流。
+        private void ReserveDialogAudioKeys()
+        {
+            foreach (var pair in ScreenDefs)
+                if (pair.Value.Mode == ScreenMode.DialogHook)
+                    Register("MusicBox.Screen." + pair.Key, new AudioStreamWav(), false);
+        }
+
         private bool Register(string key, AudioStream stream, bool allowOverride)
         {
             if (_context == null || stream == null || string.IsNullOrWhiteSpace(key))
                 return false;
             if (_context.TryRegister("Audio", key, Variant.From(stream), allowOverride, out string diagnostic))
             {
-                _context.Log($"已注册音频：{key}");
                 return true;
             }
             _context.Warn($"注册音频失败 {key}：{diagnostic}");
@@ -786,9 +931,17 @@ namespace MusicBoxMod
         // 玩家会看到“配置已保存，但 Mod 应用配置时出错，请重启游戏”。
         private void OnSettingsChanged(IReadOnlyList<string> keys)
         {
-            _context?.Log("收到面板变更通知：" + string.Join("、", keys));
-            Reload();
-            _context?.Log("面板配置已即时生效：" + string.Join("、", keys));
+            if (!_running)
+                return;
+            if (keys.Count > 0 && keys.All(key => key == PlayerVisibleSetting || key == "playbackOrder" || key == "playerAlwaysOnTop"))
+            {
+                _panelStamp = DateTime.MinValue;
+                if (RefreshStoredValues()) _menuPlayer?.RefreshVisibility();
+                return;
+            }
+            string before = _appliedSignature;
+            if (Reload() && before != _appliedSignature)
+                _context?.Log("音乐配置已生效：" + _appliedSignature);
         }
 
         // 宿主的 Changed 只在「包体一致 + 值真的变了」时推送，而它比对包体哈希用的是大小写敏感的 ==：
@@ -803,69 +956,79 @@ namespace MusicBoxMod
             if (_settings == null || _context == null)
                 return;
             string path = StoredPanelPath();
-            if (!File.Exists(path))
+            if (File.Exists(path) && File.GetLastWriteTimeUtc(path) == _panelStamp)
                 return;
-            DateTime stamp = File.GetLastWriteTimeUtc(path);
-            if (stamp == _panelStamp)
+            if (!RefreshStoredValues())
                 return;
-            RefreshStoredValues();
             string current = PanelSignature();
             if (current == _appliedSignature)
                 return;
-            _context?.Log($"面板落盘值与已应用值不同（{reason}）：{_appliedSignature} → {current}，当场应用");
-            Reload();
+            if (Reload())
+                _context?.Log("音乐配置已生效：" + _appliedSignature);
         }
 
         private string StoredPanelPath() => ProjectSettings.GlobalizePath(
             "user://ModSettings/" + StorageHash(_context.ModId) + ".json");
 
         // 把面板落盘的值读成模组自己的副本；宿主通知到达时也会先刷新，避免用到旧副本。
-        private void RefreshStoredValues()
+        private bool RefreshStoredValues()
         {
             if (_settings == null || _context == null)
-                return;
+                return true;
             string path = StoredPanelPath();
             if (!File.Exists(path))
-                return;
-            _panelStamp = File.GetLastWriteTimeUtc(path);
-            ReadStoredValues(path);
+            {
+                _panelScalar.Clear();
+                _panelBool.Clear();
+                _panelStamp = DateTime.MinValue;
+                return true;
+            }
+            DateTime stamp = File.GetLastWriteTimeUtc(path);
+            if (stamp == _panelStamp)
+                return true;
+            if (!ReadStoredValues(path))
+                return false;
+            _panelStamp = stamp;
+            return true;
         }
 
         private bool ReadStoredValues(string path)
         {
-            _panelScalar.Clear();
-            _panelBool.Clear();
+            // 解析成功并确认文件未继续变化后才提交；失败不清掉上次可用的配置。
             try
             {
-                var json = new Json();
-                if (json.Parse(File.ReadAllText(path)) != Error.Ok)
+                string stamp = AudioFileStamp(path);
+                JsonNode root = JsonNode.Parse(File.ReadAllText(path));
+                if (root is not JsonObject || root["values"] is not JsonObject values)
+                    throw new InvalidDataException("缺少 values 对象");
+                // 与宿主 XWModSettingsService.Read 的身份/版本规则一致。
+                if (root["version"]?.GetValue<int>() != 1 || TextOf(root["modId"]) != _context.ModId.Trim().ToLowerInvariant())
+                    throw new InvalidDataException("配置文件身份或版本不匹配");
+                var scalars = new Dictionary<string, string>(StringComparer.Ordinal);
+                var switches = new Dictionary<string, bool>(StringComparer.Ordinal);
+                foreach (var pair in values)
                 {
-                    _context?.Warn("面板配置文件解析失败，保持当前生效值：" + json.GetErrorMessage());
-                    return false;
+                    if (pair.Value == null)
+                        continue;
+                    if ((GroupSwitches.ContainsValue(pair.Key) || pair.Key == PlayerVisibleSetting || pair.Key == "playerAlwaysOnTop") && pair.Value.GetValueKind() == JsonValueKind.True)
+                        switches[pair.Key] = true;
+                    else if ((GroupSwitches.ContainsValue(pair.Key) || pair.Key == PlayerVisibleSetting || pair.Key == "playerAlwaysOnTop") && pair.Value.GetValueKind() == JsonValueKind.False)
+                        switches[pair.Key] = false;
+                    else if (pair.Value.GetValueKind() == JsonValueKind.String && IsKnownOption(pair.Key, TextOf(pair.Value)))
+                        scalars[pair.Key] = TextOf(pair.Value).Trim();
                 }
-                var root = json.Data.AsGodotDictionary();
-                if (!root.TryGetValue("values", out var values) || values.VariantType != Variant.Type.Dictionary)
-                    return false;
-                foreach (var pair in values.AsGodotDictionary())
-                {
-                    string key = pair.Key.AsString();
-                    if (pair.Value.VariantType == Variant.Type.Bool
-                        && GroupSwitches.ContainsValue(key))
-                    {
-                        _panelBool[key] = pair.Value.AsBool();
-                    }
-                    else if (pair.Value.VariantType == Variant.Type.String)
-                    {
-                        // 认不出的值（例如包更新后旧选项被删）不采用，交回宿主的生效值。
-                        if (IsKnownOption(key, pair.Value.AsString()))
-                            _panelScalar[key] = pair.Value.AsString().Trim();
-                    }
-                }
+                if (AudioFileStamp(path) != stamp)
+                    throw new IOException("配置文件仍在写入");
+                _panelScalar.Clear();
+                foreach (var pair in scalars) _panelScalar.Add(pair.Key, pair.Value);
+                _panelBool.Clear();
+                foreach (var pair in switches) _panelBool.Add(pair.Key, pair.Value);
                 return true;
             }
             catch (Exception exception)
             {
-                _context?.Warn("读取面板配置文件失败，保持当前生效值：" + exception.GetBaseException().Message);
+                WarnOnce("面板读取 " + exception.GetBaseException().Message,
+                    "读取面板配置失败，保留当前状态并稍后重试：" + exception.GetBaseException().Message);
                 return false;
             }
         }
@@ -875,10 +1038,9 @@ namespace MusicBoxMod
             option = option?.Trim();
             if (string.IsNullOrEmpty(option))
                 return false;
-            if (option == OffOption)
-                return true;
             // 界面曲目的下拉值就是文件名（不含扩展名），选项清单由本机目录生成，
             // 所以这里只认得键，具体能不能播交给 SlotPath 判定。
+            if (key == "playbackOrder") return option == "sequence" || option == "reverse" || option == "shuffle" || option == "loop";
             return ScreenSettings.Any(pair => pair.Setting == key);
         }
 
@@ -892,31 +1054,61 @@ namespace MusicBoxMod
         // 每秒看一眼面板有没有落盘（只比时间戳，不改文件就不解析）。
         private void StartPanelWatch()
         {
-            if (_settings == null || Engine.GetMainLoop() is not SceneTree tree)
+            if (!_running || _panelTimer != null || Engine.GetMainLoop() is not SceneTree tree)
                 return;
-            var timer = tree.CreateTimer(1.0);
-            timer.Timeout += () =>
+            int generation = _generation;
+            _panelTimer = tree.CreateTimer(1.0);
+            _panelTimeout = () =>
             {
+                if (!_running || generation != _generation)
+                    return;
+                _panelTimer = null;
+                _panelTimeout = null;
                 try { SyncStoredPanelValues("定时核对"); }
-                catch (Exception exception) { _context?.Warn("核对面板配置失败：" + exception.GetBaseException().Message); }
+                catch (Exception exception) { WarnOnce("面板核对", "核对面板配置失败：" + exception.GetBaseException().Message); }
                 try { MaybeRescanMusicLibrary(); }
-                catch (Exception exception) { _context?.Warn("核对音乐目录失败：" + exception.GetBaseException().Message); }
+                catch (Exception exception) { WarnOnce("目录核对", "核对音乐目录失败，将继续重试：" + exception.GetBaseException().Message); }
                 StartPanelWatch();
             };
+            _panelTimer.Timeout += _panelTimeout;
         }
 
-        private void Reload()
+        private bool Reload(bool rescanLibrary = false)
         {
+            if (!_running || !RefreshStoredValues())
+                return false;
+            // 慢操作先完成，再拆旧钩子；扫描/加载异常时旧播放器仍可继续播放。
+            var oldSlots = _slots.ToArray();
+            var oldBlocked = _blockedSlots.ToArray();
+            var oldOverrides = _bgmOverrides.ToArray();
+            string oldStamp = _musicStamp;
+            try
+            {
+                if (rescanLibrary)
+                    LoadConfig();
+                BuildSelections();
+            }
+            catch
+            {
+                _slots.Clear();
+                foreach (var pair in oldSlots) _slots.Add(pair.Key, pair.Value);
+                _blockedSlots.Clear();
+                foreach (var pair in oldBlocked) _blockedSlots.Add(pair.Key, pair.Value);
+                _bgmOverrides.Clear();
+                _bgmOverrides.AddRange(oldOverrides);
+                _musicStamp = oldStamp;
+                throw;
+            }
+            RestoreActiveDialogs();
             UnhookSceneEvents();
             foreach (SceneSwap swap in _sceneSwaps)
                 RestoreSceneSwap(swap);
             _sceneSwaps.Clear();
             _dialogHooks.Clear();
-            LoadConfig();
-            RefreshStoredValues();
-            ApplyRegistrations();
+            ApplyRegistrations(rebuildSelections: false);
             HookSceneEvents();
             RefreshAppliedMusicMembers();
+            return true;
         }
 
         // ---------- 场景钩子 ----------
@@ -931,10 +1123,33 @@ namespace MusicBoxMod
             _tree.NodeAdded += OnNodeAdded;
             _tree.ProcessFrame += OnResumeFrame;
             _hooked = true;
+            Callable.From(EnsurePlayerMounted).CallDeferred();
+            TrackExistingScreens(_tree.Root);
+        }
+
+        private void TrackExistingScreens(Node node)
+        {
+            OnNodeAdded(node);
+            foreach (Node child in node.GetChildren())
+                TrackExistingScreens(child);
+        }
+
+        private void RestoreActiveDialogs()
+        {
+            foreach (DialogHook hook in _dialogHooks)
+                if (_screenExits.Keys.Any(node => GodotObject.IsInstanceValid(node) && MatchesScreen(node, hook.Screen)))
+                    RestoreDialogMusic(hook);
         }
 
         private void UnhookSceneEvents()
         {
+            foreach (var pair in _playerDialogs)
+                if (GodotObject.IsInstanceValid(pair.Key)) pair.Key.TreeExiting -= pair.Value;
+            _playerDialogs.Clear();
+            foreach (var pair in _screenExits)
+                if (GodotObject.IsInstanceValid(pair.Key))
+                    pair.Key.TreeExiting -= pair.Value;
+            _screenExits.Clear();
             if (_hooked && GodotObject.IsInstanceValid(_tree))
             {
                 _tree.NodeAdded -= OnNodeAdded;
@@ -947,7 +1162,7 @@ namespace MusicBoxMod
 
         private void OnResumeFrame()
         {
-            if (_resumeWatchFailed || _appliedMusicKeys.Count == 0)
+            if (!_running || _resumeWatchFailed || _appliedMusicKeys.Count == 0)
                 return;
             AudioManager audio = AudioManager.Instance;
             if (audio == null
@@ -957,7 +1172,8 @@ namespace MusicBoxMod
             {
                 foreach (string key in _appliedMusicKeys)
                 {
-                    if (!ResumeMusicKeys.Contains(key)
+                    if ((_menuPlayer?.OwnsPlayback == true && _menuPlayer.OwnedKey == key)
+                        || !ResumeMusicKeys.Contains(key)
                         || !players.TryGetValue(key, out AudioStreamPlayerMember player)
                         || !GodotObject.IsInstanceValid(player) || !player.IsPlaying())
                     {
@@ -975,7 +1191,6 @@ namespace MusicBoxMod
                     {
                         player.Play(seen.Position);
                         _resumeSeen[key] = (stream, seen.Position);
-                        _context?.Log($"界面音乐续播 {key}：在 {position:0.00}s 处被重新起播，已接回 {seen.Position:0.0}s");
                         continue;
                     }
                     _resumeSeen[key] = (stream, position);
@@ -992,32 +1207,55 @@ namespace MusicBoxMod
 
         private void OnNodeAdded(Node node)
         {
-            if (node == null)
+            if (_running && node != null) TrackPlayerDialog(node);
+            // Ordinary option/help dialogs do not release or restart music. Explicit
+            // Shop/Almanac handoffs retain their existing independent selections.
+            if (node is Shop || node is Almanac)
+                _menuPlayer?.Suspend();
+            if (!_running || node == null || _screenExits.ContainsKey(node)
+                || !ScreenSettings.Any(pair => MatchesScreen(node, pair.Screen)))
                 return;
+            Action exit = () => OnScreenExiting(node);
+            _screenExits.Add(node, exit);
+            node.TreeExiting += exit;
 
             foreach (SceneSwap swap in _sceneSwaps)
             {
                 if (!MatchesScreen(node, swap.Screen))
                     continue;
-                SceneSwap captured = swap;
-                ApplySceneSwap(captured);
-                node.TreeExiting += () => RestoreSceneSwap(captured);
+                ApplySceneSwap(swap);
             }
 
             foreach (DialogHook hook in _dialogHooks)
             {
                 if (!MatchesScreen(node, hook.Screen))
                     continue;
-                DialogHook captured = hook;
-                StartDialogMusic(captured);
-                if (!string.IsNullOrEmpty(captured.RestoreKey))
-                    node.TreeExiting += () => RestoreDialogMusic(captured);
+                StartDialogMusic(hook);
             }
+        }
+
+        private void OnScreenExiting(Node node)
+        {
+            if (_screenExits.TryGetValue(node, out Action exit))
+                node.TreeExiting -= exit;
+            _screenExits.Remove(node);
+            if (!_running)
+                return;
+            foreach (SceneSwap swap in _sceneSwaps)
+                if (MatchesScreen(node, swap.Screen)
+                    && !_screenExits.Keys.Any(other => GodotObject.IsInstanceValid(other) && MatchesScreen(other, swap.Screen)))
+                    RestoreSceneSwap(swap);
+            foreach (DialogHook hook in _dialogHooks)
+                if (MatchesScreen(node, hook.Screen)
+                    && !_screenExits.Keys.Any(other => GodotObject.IsInstanceValid(other) && MatchesScreen(other, hook.Screen)))
+                    RestoreDialogMusic(hook);
         }
 
         private static bool MatchesScreen(Node node, string screen) => screen switch
         {
             "LevelChoose" => node is LevelChoose,
+            "LevelEditorStage" => node is LevelEditorStage,
+            "AwardSettlement" => node is AwardSettlement,
             "Shop" => node is Shop,
             "MainMenu" => node is MainMenu,
             "Almanac" => node is Almanac,
@@ -1033,7 +1271,7 @@ namespace MusicBoxMod
             swap.Original = original;
             manager.AUDIOS[swap.GameKey] = swap.Stream;
             swap.Applied = true;
-            _context?.Log($"界面音乐键临时替换：{swap.Screen} → {swap.GameKey}");
+            RefreshMusicMember(swap.GameKey);
         }
 
         private void RestoreSceneSwap(SceneSwap swap)
@@ -1041,10 +1279,15 @@ namespace MusicBoxMod
             var manager = ResourceManager.Instance;
             if (manager == null || !swap.Applied)
                 return;
-            if (swap.HasOriginal)
-                manager.AUDIOS[swap.GameKey] = swap.Original;
-            else
-                manager.AUDIOS.Remove(swap.GameKey);
+            if (manager.AUDIOS.TryGetValue(swap.GameKey, out Resource current) && ReferenceEquals(current, swap.Stream))
+            {
+                if (_menuPlayer?.OwnedKey == swap.GameKey) _menuPlayer.Suspend();
+                if (swap.HasOriginal)
+                    manager.AUDIOS[swap.GameKey] = swap.Original;
+                else
+                    manager.AUDIOS.Remove(swap.GameKey);
+                if (!RefreshMusicMember(swap.GameKey)) StopMusicMember(swap.GameKey);
+            }
             swap.Applied = false;
         }
 
@@ -1059,7 +1302,6 @@ namespace MusicBoxMod
                 if (GodotObject.IsInstanceValid(stop))
                     stop.Stop();
                 audio.AudioPlay(hook.PlayKey, AudioManagerEnum.TYPE.MUSIC);
-                _context?.Log($"界面音乐已切换：{hook.Screen} → {hook.PlayKey}");
             }
             catch (Exception exception)
             {
@@ -1109,9 +1351,19 @@ namespace MusicBoxMod
             if (package == null)
                 return;
 
+            string originalHash = PackageHash(package);
+            if (_packageHash != null && _packageHash != originalHash)
+            {
+                WarnOnce("安装包已更换", "检测到安装包已被外部更新，停止回写声明，请重启游戏。");
+                return;
+            }
+            _packageHash = originalHash;
             string changelog = ChangelogBody(ReadPackageEntry(package, ChangelogEntryName));
             string postId = DesiredPostId();
-            string signature = string.Join("|", tracks) + "#" + changelog + "#" + postId;
+            var signatureParts = new JsonArray();
+            foreach (string stem in tracks)
+                signatureParts.Add(new JsonObject { ["value"] = stem, ["label"] = TrackLabel(stem) });
+            string signature = signatureParts.ToJsonString() + "#" + changelog + "#" + postId;
             if (signature == _declaredSignature)
                 return;
 
@@ -1141,14 +1393,16 @@ namespace MusicBoxMod
                     _context.Warn("重写出来的安装包没通过宿主清单校验，保留原包：" + diagnostic);
                     return;
                 }
+                if (PackageHash(package) != originalHash)
+                {
+                    WarnOnce("安装包已更换", "同步期间安装包已被更新，保留新包并跳过回写。");
+                    return;
+                }
+                string rewrittenHash = PackageHash(temp);
                 File.Move(temp, package, overwrite: true);
+                _packageHash = rewrittenHash;
                 _declaredSignature = signature;
-                _context.Log($"（{reason}）配置面板已跟着更新：曲目下拉 {tracks.Count} 首"
-                             + (tracks.Count == 0 ? "（空）" : "（" + string.Join("、", tracks) + "）")
-                             + (string.IsNullOrEmpty(changelog) ? "，更新内容没读到" : "，更新内容已同步")
-                             + (postId.Length == 0 ? "，官网投稿绑定已清空（下次启动起不再参加游戏的官网检查）"
-                                                    : "，官网投稿仍绑 " + postId)
-                             + "。本局 Mod 管理会把本模组标成旧版本，重启游戏后自动恢复。");   // 措辞对新旧宿主都成立：新宿主读作「正在使用旧版本，重启后更新」
+                _context.Log($"配置面板声明已同步（曲目={tracks.Count}）；本局可能显示旧版本，重启后恢复。");
             }
             catch (Exception exception)
             {
@@ -1273,7 +1527,8 @@ namespace MusicBoxMod
             if (current == null || current.Count != desired.Count)
                 return false;
             for (int index = 0; index < current.Count; index++)
-                if (!string.Equals(TextOf(current[index]?["value"]), TextOf(desired[index]?["value"]), StringComparison.Ordinal))
+                if (!string.Equals(TextOf(current[index]?["value"]), TextOf(desired[index]?["value"]), StringComparison.Ordinal)
+                    || !string.Equals(TextOf(current[index]?["label"]), TextOf(desired[index]?["label"]), StringComparison.Ordinal))
                     return false;
             return true;
         }
@@ -1294,7 +1549,15 @@ namespace MusicBoxMod
                 try
                 {
                     if (ModLoader.TryReadPackageMetadata(candidate, out XWModManifest manifest, out _, out _))
+                    {
                         id = manifest?.Id;
+                        if (string.Equals(id, _context.ModId, StringComparison.OrdinalIgnoreCase)
+                            && !string.Equals(manifest?.Version, _context.ModVersion, StringComparison.Ordinal))
+                        {
+                            WarnOnce("安装包版本已变", "磁盘安装包版本与运行版本不同，跳过声明回写，请重启游戏。");
+                            return null;
+                        }
+                    }
                 }
                 catch { continue; }
                 if (!string.Equals(id, _context.ModId, StringComparison.OrdinalIgnoreCase))
@@ -1310,6 +1573,9 @@ namespace MusicBoxMod
                 _context.Warn($"{dir} 里没找到 ID 为 {_context.ModId} 的安装包，面板下拉不会跟着目录更新。");
             return found;
         }
+
+        private static string PackageHash(string package) => Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(package)));
 
         private string ReadPackageEntry(string package, string name)
         {
@@ -1371,10 +1637,22 @@ namespace MusicBoxMod
         // 玩家往目录里丢文件或换掉同名文件后不必重启：定时核对里比一下 BGM 目录的指纹。
         private void MaybeRescanMusicLibrary()
         {
-            if (MusicStamp() == _musicStamp)
+            string stamp = MusicStamp();
+            if (stamp == _musicStamp)
+            {
+                _pendingMusicStamp = null;
                 return;
-            _context?.Log("检测到 BGM 目录变动，重载。");
-            Reload();
+            }
+            // 连续两次一致再读，避免文件刚开始复制就解码、重写包。
+            if (stamp != _pendingMusicStamp)
+            {
+                _pendingMusicStamp = stamp;
+                return;
+            }
+            if (!Reload(rescanLibrary: true))
+                return;
+            _pendingMusicStamp = null;
+            _context?.Log($"音乐目录已更新：曲目={_slots.Count}，战斗覆盖={_bgmOverrides.Count}");
             SyncPackageDeclarations("目录变动");
         }
     }
